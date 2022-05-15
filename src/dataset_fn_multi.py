@@ -47,17 +47,19 @@ class CapacityDataset(data.Dataset):
 
         if self.transform:
             images = self.transform(images)
-        # import matplotlib.pyplot as plt
-        # h = torch.histc(images.cpu())
-        # plt.plot(torch.arange(0, 1, 1 / 100)[:100], h)
-        # plt.show()
-        return images.to(device='cuda'), labels.to(device='cuda')
+        return images, labels
 
     def __len__(self):
         return self.dataset_length
 
 
-def get_capacity_dataloaders(dataset_path, tr_ratio, n_samples, n_frames, batch_size_train, batch_size_valid):
+def get_capacity_dataloaders(dataset_path, dataset_dir, tr_ratio, n_samples,
+                             n_frames, batch_size_train, batch_size_valid):
+
+    # Initialize dataset-dependent parameters
+    dataset_path = dataset_path[dataset_dir]
+    n_samples = n_samples[dataset_dir]
+    n_frames = n_frames[dataset_dir]  # TODO: check with n_frames_max
 
     # Initialize dataset file
     img_dims = (32, 32) if any([s in dataset_path for s in ['03.', '04.', '05.', '06.']]) else (2, 4)

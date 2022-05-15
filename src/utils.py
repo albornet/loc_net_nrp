@@ -3,15 +3,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 import imageio
 import numpy as np
-from src.loss_fn import FocalLoss, DiceLoss
+import matplotlib.pyplot as plt
+from src.dataset_fn_multi import six_dof_to_euler
+from cosine_annealing_warmup import CosineAnnealingWarmupRestarts
+
 bce_loss_fn = nn.BCEWithLogitsLoss()
 mse_loss_fn = nn.MSELoss()
 mae_loss_fn = nn.L1Loss()
-foc_loss_fn = FocalLoss(alpha=0.5, gamma=2.0, reduction='mean')
-dice_loss_fn = DiceLoss()
 
-def train_fn(train_dl, model, optimizer, loss_weight, t_start,
-             n_backprop_frames, epoch, plot_gif=True):
+def train_fn(train_dl, model, optimizer, scheduler, loss_params, epoch, plot_gif=True):
 
     # Train the network for one epoch
     model.train()
@@ -27,17 +27,17 @@ def train_fn(train_dl, model, optimizer, loss_weight, t_start,
 
             for t in range(n_frames):
                 A = images[..., t].to(device=model.device)
-                L_lbl = L_lbls[..., t].to(device='cuda')
+                L_lbl = L_lbls[..., t].to(device=model.device)
                 E, P, L = model(A, t)
                 A_seq.append(A.detach().cpu())
                 P_seq.append(P.detach().cpu())
                 L_seq.append(L.detach().cpu())
                 L_lbl_seq.append(L_lbl.detach().cpu())
-                time_weight = float(t >= t_start)
+                time_weight = float(t >= loss_params['t_start'])  # 0.0 if t < loss_params['t_start'] else (1.0 / t)
                 loss = loss + loss_fn(E, A, P, L, L_lbl,
-                                      time_weight, loss_weight, batch_idx, n_batches)
+                                      time_weight, loss_params, batch_idx, n_batches)
 
-                if (t + 1) % n_backprop_frames == 0:
+                if (t + 1) % loss_params['n_backprop_frames'] == 0:
                     optimizer.zero_grad()
                     loss.backward()
                     nn.utils.clip_grad_norm_(model.parameters(), max_norm=1)  # slowdown?
@@ -55,12 +55,17 @@ def train_fn(train_dl, model, optimizer, loss_weight, t_start,
                 L_lbl_seq = torch.stack(L_lbl_seq, axis=-1)
                 plot_recons(A_seq, L_lbl_seq, P_seq, L_seq, epoch=epoch,
                     output_dir=f'./ckpt/{model.model_name}/')
+
+            if type(scheduler) is torch.optim.lr_scheduler.OneCycleLR:
+                scheduler.step()
+            elif batch_idx == (len(train_dl) - 1):
+                scheduler.step()
                 
     print(f'\r\nEpoch train loss : {sum(plot_loss_train) / len(plot_loss_train)}')
     return plot_loss_train
 
 
-def valid_fn(valid_dl, model, loss_weight, t_start, epoch, plot_gif=True):
+def valid_fn(valid_dl, model, loss_params, epoch, plot_gif=True):
 
     model.eval()
     plot_loss_valid = []  # 0.0
@@ -78,9 +83,9 @@ def valid_fn(valid_dl, model, loss_weight, t_start, epoch, plot_gif=True):
                 P_seq.append(P.detach().cpu())
                 L_seq.append(L.detach().cpu())
                 L_lbl_seq.append(L_lbl.detach().cpu())
-                time_weight = float(t >= t_start)
+                time_weight = float(t >= loss_params['t_start'])  # 0.0 if t < loss_params['t_start'] else (1.0 / t)
                 loss = loss_fn(E, A, P, L, L_lbl, time_weight,
-                               loss_weight, batch_idx, n_batches)
+                               loss_params, batch_idx, n_batches)
                 batch_loss_valid += loss.item() / n_frames
             plot_loss_valid.append(batch_loss_valid)  # += batch_loss_valid / n_batches
             if ((epoch == 0 and (batch_idx % 10) == 0) or (batch_idx == 0)) and plot_gif:
@@ -97,35 +102,37 @@ def valid_fn(valid_dl, model, loss_weight, t_start, epoch, plot_gif=True):
     return plot_loss_valid
 
 
-def loss_fn(E, frame, P, L, L_lbl, time_weight, loss_weight, batch_idx, n_batches):
+def loss_fn(E, frame, P, L, L_lbl, time_weight, loss_params, batch_idx, n_batches):
 
     # Latent prediction error loss (unsupervised)
-    latent_loss = 0.0 if E is None else sum([torch.mean(E[l]) * w for l, w in enumerate(loss_weight['latent'])])
+    latent_loss = 0.0 if E is None else sum([torch.mean(E[l]) * w for l, w in enumerate(loss_params['latent'])])
     
     # Image prediction loss (unsupervised)
-    img_mae_loss = mae_loss_fn(P, frame) * loss_weight['prd_mae'] if loss_weight['prd_mae'] else 0.0
-    img_mse_loss = mse_loss_fn(P, frame) * loss_weight['prd_mse'] if loss_weight['prd_mse'] else 0.0
-    img_bce_loss = bce_loss_fn(P, frame) * loss_weight['prd_bce'] if loss_weight['prd_bce'] else 0.0
+    img_mae_loss = mae_loss_fn(P, frame) * loss_params['prd_mae'] if loss_params['prd_mae'] else 0.0
 
     # Localization prediction loss (supervised)
-    loc_mae_loss = mae_loss_fn(L, L_lbl) * loss_weight['loc_mae'] if loss_weight['loc_mae'] else 0.0
-    loc_mse_loss = mse_loss_fn(L, L_lbl) * loss_weight['loc_mse'] if loss_weight['loc_mse'] else 0.0
-    loc_bce_loss = bce_loss_fn(L, L_lbl) * loss_weight['loc_bce'] if loss_weight['loc_bce'] else 0.0
+    loc_mae_loss = mae_loss_fn(L, L_lbl) * loss_params['loc_mae'] if loss_params['loc_mae'] else 0.0
+    loc_mse_loss = mse_loss_fn(L, L_lbl) * loss_params['loc_mse'] if loss_params['loc_mse'] else 0.0
+    loc_bce_loss = bce_loss_fn(L, L_lbl) * loss_params['loc_bce'] if loss_params['loc_bce'] else 0.0
    
     # Total loss
-    img_loss = img_mae_loss + img_mse_loss + img_bce_loss
+    img_loss = img_mae_loss
     loc_loss = loc_mae_loss + loc_mse_loss + loc_bce_loss
     total_loss = latent_loss + img_loss + (loc_loss if loc_loss > 0 else 0.0)
     print(
         f'\rBatch ({batch_idx + 1}/{n_batches}) - loss: {total_loss:.3f} [' +
-        f'latent: {latent_loss:.3f}, ' +
-        f'image: {img_loss:.3f} (mae: {img_mae_loss:.3f}, mse: {img_mse_loss:.3f}, bce: {img_bce_loss:.3f}) ' +
+        f'latent: {latent_loss:.3f}, image: {img_loss:.3f} (mae: {img_mae_loss:.3f}) ' +
         f'loc: {loc_loss:.3f} (mae: {loc_mae_loss:.3f}, mse: {loc_mse_loss:.3f}, bce: {loc_bce_loss:.3f})]', end='')
     return total_loss * time_weight
 
 
-def plot_recons(A_seq, L_lbl_seq, P_seq, L_seq,
-    epoch=0, sample_indexes=(0,), output_dir='./', mode='train'):
+def plot_recons(A_seq, L_lbl_seq, P_seq, L_seq, epoch=0, sample_indexes=(0,), output_dir='./', mode='train'):
+
+    fig, ax = plot_loc_sequence(L_seq, L_lbl_seq)
+    for s_idx in sample_indexes:
+        png_path = rf'{output_dir}\pngs\{mode}_epoch{epoch:02}_id{s_idx:02}.png'
+        fig.savefig(png_path)
+    plt.close()
 
     batch_size, n_channels, n_rows, n_cols, n_frames = A_seq.shape
     img_plot = A_seq.numpy()
@@ -152,5 +159,78 @@ def plot_recons(A_seq, L_lbl_seq, P_seq, L_seq,
     for s_idx in sample_indexes:
         out_seq = out_batch[s_idx]
         gif_frames = [(255. * out_seq[..., t]).astype(np.uint8) for t in range(n_frames)]
-        gif_path = f'{output_dir}{mode}_epoch{epoch:02}_id{s_idx:02}'
-        imageio.mimsave(f'{gif_path}.gif', gif_frames, duration=0.1)
+        gif_path = rf'{output_dir}\gifs\{mode}_epoch{epoch:02}_id{s_idx:02}.gif'
+        imageio.mimsave(gif_path, gif_frames, duration=0.1)
+
+
+def plot_loc_sequence(pred_sequence, true_sequence, return_fig=True):
+    ''' Plots 3D-localization predictions.
+    
+    Parameters
+    ----------
+    pred_sequence : torch.tensor of shape (batch_size, 3 + 6, n_frames)
+        containing the localization predictions (3-dof position and 6-dof orientation)
+    true_sequence : torch.tensor of shape (batch_size, 3 + 6, n_frames)
+        containing the true localizations (3-dof position and 6-dof orientation)
+    
+    Returns
+    -------
+    None
+    '''
+    pos_pred_sequence = pred_sequence[0, :3, :].transpose(0, 1)
+    ori_pred_sequence = pred_sequence[0, 3:, :].transpose(0, 1)
+    ori_pred_sequence = six_dof_to_euler(ori_pred_sequence)
+    pos_pred_sequence_array = pos_pred_sequence.numpy()
+    ori_pred_sequence_array = ori_pred_sequence.numpy()
+    pos_x_hat, pos_y_hat, pos_z_hat = [pos_pred_sequence_array[:, i] for i in [0, 1, 2]]
+    ori_a_hat, ori_b_hat, ori_c_hat = [ori_pred_sequence_array[:, i] for i in [0, 1, 2]]
+
+    pos_true_sequence = true_sequence[0, :3, :].transpose(0, 1)
+    ori_true_sequence = true_sequence[0, 3:, :].transpose(0, 1)
+    ori_true_sequence = six_dof_to_euler(ori_true_sequence)    
+    pos_true_sequence_array = pos_true_sequence.numpy()
+    ori_true_sequence_array = ori_true_sequence.numpy()
+    pos_x, pos_y, pos_z = [pos_true_sequence_array[:, i] for i in [0, 1, 2]]
+    ori_a, ori_b, ori_c = [ori_true_sequence_array[:, i] for i in [0, 1, 2]]
+
+    time_axis = range(pred_sequence.shape[-1])
+    fig, ax = plt.subplots(figsize=(10, 4))
+    plt.subplot(1, 2, 1)
+    plt.plot(time_axis, pos_x_hat, 'r--', label='x_hat')
+    plt.plot(time_axis, pos_y_hat, 'g--', label='y_hat')
+    plt.plot(time_axis, pos_z_hat, 'b--', label='z_hat')
+    plt.plot(time_axis, pos_x, 'r-', label='x')
+    plt.plot(time_axis, pos_y, 'g-', label='y')
+    plt.plot(time_axis, pos_z, 'b-', label='z')
+    ax_pos = plt.gca()
+    ax_pos.set_ylim([-0.5, 0.5])
+    plt.legend(fontsize=8)
+    
+    plt.subplot(1, 2, 2)
+    plt.plot(time_axis, ori_a_hat, 'r--', label='alpha_hat')
+    plt.plot(time_axis, ori_b_hat, 'g--', label='beta_hat')
+    plt.plot(time_axis, ori_c_hat, 'b--', label='gamma_hat')
+    plt.plot(time_axis, ori_a, 'r-', label='alpha')
+    plt.plot(time_axis, ori_b, 'g-', label='beta')
+    plt.plot(time_axis, ori_c, 'b-', label='gamma')
+    ax_ori = plt.gca()
+    ax_ori.set_ylim([-torch.pi, torch.pi])
+    plt.legend(fontsize=8)
+    
+    if return_fig:
+        return fig, ax
+    else:
+        plt.show()
+
+
+def select_scheduler(optimizer, lr_params):
+    if lr_params['scheduler_type'] == 'multistep':
+        return torch.optim.lr_scheduler.MultiStepLR(optimizer, **lr_params['multistep'])
+    elif lr_params['scheduler_type'] == 'cosine':
+        return CosineAnnealingWarmupRestarts(optimizer, **lr_params['cosine'])
+    elif lr_params['scheduler_type'] == 'onecycle':
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, **lr_params['onecycle'])
+        if scheduler.last_epoch != -1:  # not sure if necessary
+            lr_params['onecycle']['last_epoch'] = scheduler.last_epoch
+            scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, **lr_params['onecycle'])
+        return scheduler

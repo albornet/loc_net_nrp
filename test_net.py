@@ -1,122 +1,99 @@
 import torch
-import numpy as np
-import imageio
-from src.model import PredNet
+import matplotlib.pyplot as plt
+# from src.model import PredNet
+from src.model_old import PredNet
+from src.dataset_fn_multi import six_dof_to_euler, get_capacity_dataloaders
 
-def load_image_sequence(folder_path, n_frames):
-    ''' Loads a sequence of images from a given folder path.
+
+def main():
+    ''' Test the PredNet model on a sequence of images.'''
+    
+    # Load model
+    device = 'cuda'
+    model_name = 'BU(64-128-256)_TD(64-128-256)_TL(H-H-H)_IL(0-2)_PL(0-1)_OL(0-1)'
+    model, _, _, _, _ = PredNet.load_model(model_name)
+    model.eval()
+    model.to(device)
+
+    # Load dataset
+    data_params = {
+        'batch_size_train': 1,
+        'batch_size_valid': 1,
+        'tr_ratio': 0.8,
+        'dataset_dir': 'capa', # 'capa', 'multi'
+        'dataset_path': {
+            'capa': r'D:\DL\datasets\nrp\capacity\capacity_dataset_06.pkl',
+            'multi': r'D:\DL\datasets\nrp\multi_sensory\capacity_dataset.pkl'},
+        'n_samples': { 'capa': 560, 'multi': 1500},
+        'n_frames': {'capa': 30, 'multi': 30}}
+    _, valid_dl = get_capacity_dataloaders(**data_params)
+    
+    # Run the model and plot the output prediction
+    with torch.no_grad():
+        for (input_sequence, label_sequence) in valid_dl:
+            loc_tensor_sequence = torch.zeros(label_sequence.shape, device=device)
+            for t in range(input_sequence.shape[-1]):
+                input_ = input_sequence[..., t].to(device=device)
+                _, _, loc_tensor = model(input_, t)
+                loc_tensor_sequence[..., t] = loc_tensor
+            pred_sequence = loc_tensor_sequence.detach().cpu()
+            true_sequence = label_sequence
+            plot_loc_sequence(pred_sequence, true_sequence)
+
+
+def plot_loc_sequence(pred_sequence, true_sequence):
+    ''' Plots 3D-localization predictions.
     
     Parameters
     ----------
-    folder_path : str
-        Path to the folder containing the images.
-    n_frames : int
-        Number of frames to load.
-    
-    Returns
-    -------
-    images : np.array
-        Array of shape (batch_size, 3, height, width, n_frames)
-        containing the images.
-    '''
-    list_of_torch_tensors = torch.rand(1, 3, 256, 256, 30)  # TODO: load from folder_path
-    list_of_torch_tensors = list_of_torch_tensors[..., :n_frames]
-    return list_of_torch_tensors  # of shape (1, n_channels, width, height)
-
-def plot_seg_image_sequence(seg_image_sequence):
-    ''' Plots a sequence of segmentation images.
-    
-    Parameters
-    ----------
-    seg_image_sequence : np.array
-        Array of shape (batch_size, 3, height, width, n_frames)
-        containing the segmentation images.
+    pred_sequence : torch.tensor of shape (batch_size, 3 + 6, n_frames)
+        containing the localization predictions (3-dof position and 6-dof orientation)
+    true_sequence : torch.tensor of shape (batch_size, 3 + 6, n_frames)
+        containing the true localizations (3-dof position and 6-dof orientation)
     
     Returns
     -------
     None
     '''
-    n_frames = len(seg_image_sequence)
-    seg_image_stack = np.stack(seg_image_sequence, axis=-1)
-    seg_image_rgb = onehot_to_rgb(seg_image_stack).transpose(0, 2, 3, 1, 4)
-    seg_image_rgb = (255 * seg_image_rgb).astype(np.uint8)
-    for sample_idx, seg_sample in enumerate(seg_image_rgb):
-        seg_sample_list = [seg_sample[..., t] for t in range(n_frames)]
-        imageio.mimsave(f'./seg_output_{sample_idx:02}.gif',
-                        seg_sample_list,
-                        duration=0.1)
+    pos_pred_sequence = pred_sequence[0, :3, :].transpose(0, 1)
+    ori_pred_sequence = pred_sequence[0, 3:, :].transpose(0, 1)
+    ori_pred_sequence = six_dof_to_euler(ori_pred_sequence)
+    pos_pred_sequence_array = pos_pred_sequence.numpy()
+    ori_pred_sequence_array = ori_pred_sequence.numpy()
+    pos_x_hat, pos_y_hat, pos_z_hat = [pos_pred_sequence_array[:, i] for i in [0, 1, 2]]
+    ori_a_hat, ori_b_hat, ori_c_hat = [ori_pred_sequence_array[:, i] for i in [0, 1, 2]]
 
-def onehot_to_rgb(onehot_array):
-    ''' Converts a one-hot encoded array to an RGB array.
+    pos_true_sequence = true_sequence[0, :3, :].transpose(0, 1)
+    ori_true_sequence = true_sequence[0, 3:, :].transpose(0, 1)
+    ori_true_sequence = six_dof_to_euler(ori_true_sequence)
+    pos_true_sequence_array = pos_true_sequence.numpy()
+    ori_true_sequence_array = ori_true_sequence.numpy()
+    pos_x, pos_y, pos_z = [pos_true_sequence_array[:, i] for i in [0, 1, 2]]
+    ori_a, ori_b, ori_c = [ori_true_sequence_array[:, i] for i in [0, 1, 2]]
+
+    time_axis = range(pred_sequence.shape[-1])
+    plt.figure(figsize=(10, 4))
+    plt.subplot(1, 2, 1)
+    plt.plot(time_axis, pos_x_hat, 'r--', label='x_hat')
+    plt.plot(time_axis, pos_y_hat, 'g--', label='y_hat')
+    plt.plot(time_axis, pos_z_hat, 'b--', label='z_hat')
+    plt.plot(time_axis, pos_x, 'r-', label='x')
+    plt.plot(time_axis, pos_y, 'g-', label='y')
+    plt.plot(time_axis, pos_z, 'b-', label='z')
+    plt.legend(fontsize=8)
     
-    Parameters
-    ----------
-    onehot_array : np.array
-        Array of shape (batch_size, height, width, n_frames, n_classes)
-        containing the one-hot encoded images.
-
-    Returns
-    -------
-    rgb_array : np.array
-        Array of shape (batch_size, height, width, n_frames, 3)
-        containing the RGB images.
-    '''
-    batch_size, num_classes, w, h, n_frames = onehot_array.shape
-    rgb_array = np.zeros((batch_size, 3, w, h, n_frames))
-    hue_space = np.linspace(0.0, 1.0, num_classes + 1)[:-1]
-    rgb_space = [hsv_to_rgb(hue) for hue in hue_space]
-    for n in range(num_classes):
-        class_tensor = onehot_array[:, n]
-        for c, color in enumerate(rgb_space[n]):
-            rgb_array[:, c] += color * class_tensor
-    return rgb_array
-
-def hsv_to_rgb(hue):
-    ''' Converts a hue value to an RGB color.
-    
-    Parameters
-    ----------
-    hue : float
-        Hue value in the range [0.0, 1.0].
-
-    Returns
-    -------
-    rgb : np.array
-        Array of shape (3,) containing the RGB color.
-    '''
-    v = 1 - abs((int(hue * 360) / 60) % 2 - 1)
-    hsv_space = [
-        [1, v, 0], [v, 1, 0], [0, 1, v],
-        [0, v, 1], [v, 0, 1], [1, 0, v]]
-    return hsv_space[int(hue * 6)]
+    plt.subplot(1, 2, 2)
+    plt.plot(time_axis, ori_a_hat, 'r--', label='alpha_hat')
+    plt.plot(time_axis, ori_b_hat, 'g--', label='beta_hat')
+    plt.plot(time_axis, ori_c_hat, 'b--', label='gamma_hat')
+    plt.plot(time_axis, ori_a, 'r-', label='alpha')
+    plt.plot(time_axis, ori_b, 'g-', label='beta')
+    plt.plot(time_axis, ori_c, 'b-', label='gamma')
+    ax = plt.gca()
+    ax.set_ylim([-torch.pi, torch.pi])
+    plt.legend(fontsize=8)
+    plt.show()
+            
 
 if __name__ == '__main__':
-    ''' Test the PredNet model on a sequence of images.'''
-
-    # Load the model
-    device = 'cuda'  # or 'cpu'
-    model = PredNet(model_name='my_model',
-                    n_classes=5,
-                    n_layers=3,
-                    seg_layers=(1, 2),
-                    bu_channels=(64, 128, 256),
-                    td_channels=(64, 128, 256),
-                    do_segmentation=True,
-                    device=device)
-    model.eval()
-
-    # Load the images
-    seg_image_sequence = []
-    image_sequence = load_image_sequence()
-    n_frames = image_sequence.shape[-1]
-    
-    # Predict the segmentation
-    with torch.no_grad():
-        for t in range(n_frames):
-            image = image_sequence[..., t].to(device=device)
-            _, _, seg_image = model(image, t)
-            seg_image_numpy = seg_image.cpu().numpy()
-            seg_image_sequence.append(seg_image_numpy)
-    
-    # Plot the segmentation
-    plot_seg_image_sequence(seg_image_sequence)
+    main()
