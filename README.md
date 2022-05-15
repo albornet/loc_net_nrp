@@ -14,9 +14,16 @@ Install the following packages in your environment
 
 ## Usage
 
-Set the model parameters and the dataset path in train_net.py
-
 To train your network
+ - Set the model parameters and the dataset path in train_net.py
+ - Run training in terminal
 ```bash
 python train_net.py
+```
+
+To test a trained network
+ - Define the model you want to load for testing in test_net.py
+ - Run the test in terminal
+```bash
+python test_net.py
 ```
